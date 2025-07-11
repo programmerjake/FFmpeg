@@ -22,12 +22,16 @@
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
-#include "subtitles.h"
+#include "libavcodec/codec_id.h"
 #include "libavutil/avstring.h"
-#include "libavutil/bprint.h"
-#include "libavutil/intreadwrite.h"
+#include "libavutil/avutil.h"
+#include "libavutil/opt.h"
+#include "subtitles.h"
 
 typedef struct MCCContext {
+    const AVClass* class;
+    int                   eia608_extract;
+    unsigned              vanc_line;
     FFDemuxSubtitlesQueue q;
 } MCCContext;
 
@@ -104,8 +108,14 @@ static int mcc_read_header(AVFormatContext *s)
 
     if (!st)
         return AVERROR(ENOMEM);
-    st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
-    st->codecpar->codec_id   = AV_CODEC_ID_EIA_608;
+    if (mcc->eia608_extract) {
+        st->codecpar->codec_type = AVMEDIA_TYPE_SUBTITLE;
+        st->codecpar->codec_id   = AV_CODEC_ID_EIA_608;
+    } else {
+        st->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        st->codecpar->codec_id   = AV_CODEC_ID_VANC_SMPTE_436M;
+        av_dict_set(&st->metadata, "data_type", "vbi_vanc_smpte_436M", 0);
+    }
     avpriv_set_pts_info(st, 64, 1, 30);
 
     while (!ff_text_eof(&tr)) {
@@ -179,11 +189,54 @@ static int mcc_read_header(AVFormatContext *s)
         }
         out[j] = 0;
 
-        if (out[7] & 0x80)
-            start += 4;
-        count = (out[11] & 0x1f) * 3;
-        if (j < start + count + 1)
-            continue;
+        if (mcc->eia608_extract) {
+            if (out[0] != 0x61 || out[1] != 0x1 || out[3] != 0x96 || out[4] != 0x69)
+                continue;
+            if (out[7] & 0x80)
+                start += 4;
+            count = (out[11] & 0x1f) * 3;
+            if (j < start + count + 1)
+                continue;
+        } else {
+            // add structure for AV_CODEC_ID_VANC_SMPTE_436M
+            static const uint8_t header[] = {
+                // Based off Table 7 (page 13) of:
+                // https://pub.smpte.org/latest/st436/s436m-2006.pdf
+                // clang-format off
+                0, 1, // number of ANC packets
+                0, 9, // line number -- overwritten later
+                4, // wrapping type -- just use vanc progressive frame
+                4, // sample coding -- 8-bit luma samples
+                0, 0, // payload sample count -- overwritten later
+                0, 0, 0, 0, // payload array length -- overwritten later
+                0, 0, 0, 1, // payload element size -- always 1
+                // clang-format on
+            };
+            int padding_len = 0, padded_len = j;
+            if (j == 0)
+                continue;
+            start = 0;
+            memmove(&out[sizeof(header)], out, j);
+            count = j + sizeof(header);
+            if (count % 4) {
+                padding_len = 4 - count % 4;
+                memset(out + count, 0, padding_len);
+                count += padding_len;
+                padded_len += padding_len;
+            }
+            memcpy(out, header, sizeof(header));
+            // line number
+            out[2] = (uint8_t)(mcc->vanc_line >> 8);
+            out[3] = (uint8_t)mcc->vanc_line;
+            // payload sample count
+            out[6] = (uint8_t)(j >> 8);
+            out[7] = (uint8_t)j;
+            // payload array length
+            out[8]  = (uint8_t)(padded_len >> 24);
+            out[9]  = (uint8_t)(padded_len >> 16);
+            out[10] = (uint8_t)(padded_len >> 8);
+            out[11] = (uint8_t)padded_len;
+        }
 
         if (!count)
             continue;
@@ -201,15 +254,53 @@ static int mcc_read_header(AVFormatContext *s)
     return ret;
 }
 
+static int mcc_read_packet(AVFormatContext* s, AVPacket* pkt)
+{
+    MCCContext* mcc = s->priv_data;
+    return ff_subtitles_queue_read_packet(&mcc->q, pkt);
+}
+
+static int mcc_read_seek(AVFormatContext* s, int stream_index, int64_t min_ts, int64_t ts, int64_t max_ts, int flags)
+{
+    MCCContext* mcc = s->priv_data;
+    return ff_subtitles_queue_seek(&mcc->q, s, stream_index, min_ts, ts, max_ts, flags);
+}
+
+static int mcc_read_close(AVFormatContext* s)
+{
+    MCCContext* mcc = s->priv_data;
+    ff_subtitles_queue_clean(&mcc->q);
+    return 0;
+}
+
+#define OFFSET(x) offsetof(MCCContext, x)
+#define SD AV_OPT_FLAG_SUBTITLE_PARAM | AV_OPT_FLAG_DECODING_PARAM
+// clang-format off
+static const AVOption mcc_options[] = {
+    { "eia608_extract", "extract EIA-608/708 captions from VANC packets", OFFSET(eia608_extract), AV_OPT_TYPE_BOOL, {.i64 = 1}, 0, 1, SD },
+    { "vanc_line", "line number of VANC packets", OFFSET(vanc_line), AV_OPT_TYPE_UINT, {.i64 = 9}, 0, 65535, SD },
+    { NULL },
+};
+// clang-format on
+
+static const AVClass mcc_class = {
+    .class_name = "mcc demuxer",
+    .item_name  = av_default_item_name,
+    .option     = mcc_options,
+    .version    = LIBAVUTIL_VERSION_INT,
+    .category   = AV_CLASS_CATEGORY_DEMUXER,
+};
+
 const FFInputFormat ff_mcc_demuxer = {
     .p.name         = "mcc",
     .p.long_name    = NULL_IF_CONFIG_SMALL("MacCaption"),
     .p.extensions   = "mcc",
+    .p.priv_class   = &mcc_class,
     .priv_data_size = sizeof(MCCContext),
     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
     .read_probe     = mcc_probe,
     .read_header    = mcc_read_header,
-    .read_packet    = ff_subtitles_read_packet,
-    .read_seek2     = ff_subtitles_read_seek,
-    .read_close     = ff_subtitles_read_close,
+    .read_packet    = mcc_read_packet,
+    .read_seek2     = mcc_read_seek,
+    .read_close     = mcc_read_close,
 };
