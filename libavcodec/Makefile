@@ -175,6 +175,7 @@ OBJS-$(CONFIG_TPELDSP)                 += tpeldsp.o
 OBJS-$(CONFIG_VAAPI_ENCODE)            += vaapi_encode.o hw_base_encode.o
 OBJS-$(CONFIG_AV1_AMF_ENCODER)         += amfenc_av1.o
 OBJS-$(CONFIG_AV1_AMF_DECODER)         += amfdec.o
+OBJS-$(CONFIG_VANC_SMPTE_436M)         += vanc_smpte_436m.o
 OBJS-$(CONFIG_VC1DSP)                  += vc1dsp.o
 OBJS-$(CONFIG_VIDEODSP)                += videodsp.o
 OBJS-$(CONFIG_VP3DSP)                  += vp3dsp.o
