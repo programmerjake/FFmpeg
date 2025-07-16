@@ -1,6 +1,7 @@
 /*
  * MCC subtitle demuxer
  * Copyright (c) 2020 Paul B Mahol
+ * Copyright (c) 2025 Jacob Lifshay
  *
  * This file is part of FFmpeg.
  *
@@ -22,9 +23,12 @@
 #include "avformat.h"
 #include "demux.h"
 #include "internal.h"
+#include "libavcodec/bytestream.h"
 #include "libavcodec/codec_id.h"
+#include "libavcodec/vanc_smpte_436m.h"
 #include "libavutil/avstring.h"
 #include "libavutil/avutil.h"
+#include "libavutil/internal.h"
 #include "libavutil/opt.h"
 #include "subtitles.h"
 
@@ -99,7 +103,11 @@ static int mcc_read_header(AVFormatContext *s)
     AVStream *st = avformat_new_stream(s, NULL);
     AVRational rate = {0};
     int64_t ts, pos;
-    uint8_t out[4096];
+    Smpte436mCodedAnc coded_anc = {
+        .line_number           = mcc->vanc_line,
+        .wrapping_type         = SMPTE_436M_WRAPPING_TYPE_VANC_FRAME,
+        .payload_sample_coding = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA,
+    };
     char line[4096];
     FFTextReader tr;
     int ret = 0;
@@ -119,11 +127,6 @@ static int mcc_read_header(AVFormatContext *s)
     avpriv_set_pts_info(st, 64, 1, 30);
 
     while (!ff_text_eof(&tr)) {
-        int hh, mm, ss, fs, i = 0, j = 0;
-        int start = 12, count = 0;
-        AVPacket *sub;
-        char *lline;
-
         ff_subtitles_read_line(&tr, line, sizeof(line));
         if (!strncmp(line, "File Format=MacCaption_MCC V", 28))
             continue;
@@ -149,103 +152,76 @@ static int mcc_read_header(AVFormatContext *s)
             continue;
         }
 
-        if (av_sscanf(line, "%d:%d:%d:%d", &hh, &mm, &ss, &fs) != 4 || rate.den <= 0)
+        int hh, mm, ss, fs, timestamp_len;
+        if (av_sscanf(line, "%d:%d:%d:%d%n", &hh, &mm, &ss, &fs, &timestamp_len) != 4 || rate.den <= 0)
             continue;
 
         ts = av_sat_add64(av_rescale(hh * 3600LL + mm * 60LL + ss, rate.num, rate.den), fs);
 
-        lline = (char *)&line;
-        lline += 12;
+        char* lline = line + timestamp_len;
+        if (*lline != '\t')
+            continue;
+        lline++;
         pos = ff_text_pos(&tr);
 
-        while (lline[i]) {
-            uint8_t v = convert(lline[i]);
+        PutByteContext pb;
+        bytestream2_init_writer(&pb, coded_anc.payload, SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY);
+
+        while (*lline) {
+            uint8_t v = convert(*lline++);
 
             if (v >= 16 && v <= 35) {
                 int idx = v - 16;
-                if (aliases[idx].len) {
-                    if (j >= sizeof(out) - 1 - aliases[idx].len) {
-                        j = 0;
-                        break;
-                    }
-                    memcpy(out + j, aliases[idx].value, aliases[idx].len);
-                    j += aliases[idx].len;
-                }
+                bytestream2_put_buffer(&pb, aliases[idx].value, aliases[idx].len);
             } else {
                 uint8_t vv;
 
-                if (i + 13 >= sizeof(line) - 1)
+                if (!*lline)
                     break;
-                vv = convert(lline[i + 1]);
-                if (j >= sizeof(out) - 1) {
-                    j = 0;
-                    break;
-                }
-                out[j++] = vv | (v << 4);
-                i++;
+                vv = convert(*lline++);
+                bytestream2_put_byte(&pb, vv | (v << 4));
             }
-
-            i++;
         }
-        out[j] = 0;
-
-        if (mcc->eia608_extract) {
-            if (out[0] != 0x61 || out[1] != 0x1 || out[3] != 0x96 || out[4] != 0x69)
-                continue;
-            if (out[7] & 0x80)
-                start += 4;
-            count = (out[11] & 0x1f) * 3;
-            if (j < start + count + 1)
-                continue;
-        } else {
-            // add structure for AV_CODEC_ID_VANC_SMPTE_436M
-            static const uint8_t header[] = {
-                // Based off Table 7 (page 13) of:
-                // https://pub.smpte.org/latest/st436/s436m-2006.pdf
-                // clang-format off
-                0, 1, // number of ANC packets
-                0, 9, // line number -- overwritten later
-                4, // wrapping type -- just use vanc progressive frame
-                4, // sample coding -- 8-bit luma samples
-                0, 0, // payload sample count -- overwritten later
-                0, 0, 0, 0, // payload array length -- overwritten later
-                0, 0, 0, 1, // payload element size -- always 1
-                // clang-format on
-            };
-            int padding_len = 0, padded_len = j;
-            if (j == 0)
-                continue;
-            start = 0;
-            memmove(&out[sizeof(header)], out, j);
-            count = j + sizeof(header);
-            if (count % 4) {
-                padding_len = 4 - count % 4;
-                memset(out + count, 0, padding_len);
-                count += padding_len;
-                padded_len += padding_len;
-            }
-            memcpy(out, header, sizeof(header));
-            // line number
-            out[2] = (uint8_t)(mcc->vanc_line >> 8);
-            out[3] = (uint8_t)mcc->vanc_line;
-            // payload sample count
-            out[6] = (uint8_t)(j >> 8);
-            out[7] = (uint8_t)j;
-            // payload array length
-            out[8]  = (uint8_t)(padded_len >> 24);
-            out[9]  = (uint8_t)(padded_len >> 16);
-            out[10] = (uint8_t)(padded_len >> 8);
-            out[11] = (uint8_t)padded_len;
-        }
-
-        if (!count)
+        if (pb.eof)
             continue;
-        sub = ff_subtitles_queue_insert(&mcc->q, out + start, count, 0);
+        // remove trailing ANC checksum byte (not to be confused with the CDP checksum byte),
+        // it's not included in 8-bit sample encodings. see section 6.2 (page 14) of:
+        // https://pub.smpte.org/latest/st436/s436m-2006.pdf
+        bytestream2_seek_p(&pb, -1, SEEK_CUR);
+        coded_anc.payload_sample_count = bytestream2_tell_p(&pb);
+        if (coded_anc.payload_sample_count == 0)
+            continue; // ignore if too small
+        // add padding to align to 4 bytes
+        while (!pb.eof && bytestream2_tell_p(&pb) % 4)
+            bytestream2_put_byte(&pb, 0);
+        if (pb.eof)
+            continue;
+        coded_anc.payload_array_length = bytestream2_tell_p(&pb);
+
+        int len;
+        if (mcc->eia608_extract) {
+            Smpte291mAnc anc;
+            if (avpriv_smpte_291m_decode_anc(
+                    &anc, coded_anc.payload_sample_coding, coded_anc.payload_sample_count, coded_anc.payload, s) < 0)
+                continue;
+            // reuse line
+            int cc_count = avpriv_smpte_291m_anc_extract_cta_708(&anc, line, s);
+            if (cc_count < 0) // continue if error or if it's not a closed captions packet
+                continue;
+            len = cc_count * 3;
+        } else {
+            // reuse line
+            len = avpriv_vanc_smpte_436m_encode(line, sizeof(line), 1, &coded_anc);
+            if (len < 0)
+                continue; // continue if error
+        }
+
+        AVPacket* sub = ff_subtitles_queue_insert(&mcc->q, line, len, 0);
         if (!sub)
             return AVERROR(ENOMEM);
 
-        sub->pos = pos;
-        sub->pts = ts;
+        sub->pos      = pos;
+        sub->pts      = ts;
         sub->duration = 1;
     }
 
