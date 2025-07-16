@@ -87,6 +87,25 @@ typedef enum Smpte436mPayloadSampleCoding
     SMPTE_436M_PAYLOAD_SAMPLE_CODING_MAX = 0xFF,
 } Smpte436mPayloadSampleCoding;
 
+#define SMPTE_291M_ANC_PAYLOAD_CAPACITY 0xFF
+
+/**
+ * An ANC packet as decoded from the payload of Smpte436mAncCoded
+ */
+typedef struct Smpte291mAnc
+{
+    uint8_t did;
+    uint8_t sdid_or_dbn;
+    uint8_t data_count;
+    uint8_t payload[SMPTE_291M_ANC_PAYLOAD_CAPACITY];
+    uint8_t checksum;
+} Smpte291mAnc;
+
+/** max number of samples that can be stored in the payload of Smpte436mCodedAnc */
+#define SMPTE_436M_CODED_ANC_SAMPLE_CAPACITY (SMPTE_291M_ANC_PAYLOAD_CAPACITY + 3)
+/** max number of bytes that can be stored in the payload of Smpte436mCodedAnc */
+#define SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY (((SMPTE_436M_CODED_ANC_SAMPLE_CAPACITY + 2) / 3) * 4)
+
 /**
  * An encoded ANC packet within a single AV_CODEC_ID_VANC_SMPTE_436M AVPacket's data.
  * The repeated section of Table 7 (page 13) of:
@@ -99,12 +118,22 @@ typedef struct Smpte436mCodedAnc
     Smpte436mPayloadSampleCoding payload_sample_coding;
     uint16_t                     payload_sample_count;
     uint32_t                     payload_array_length;
-    /** the payload, has size payload_array_length, points into
-     * the original data passed into avpriv_vanc_smpte_436m_iter_init.
+    /** the payload, has size payload_array_length.
      * can be decoded into Smpte291mAnc
      */
-    const uint8_t* payload;
+    uint8_t payload[SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY];
 } Smpte436mCodedAnc;
+
+/**
+ * Encode ANC packets into a single AV_CODEC_ID_VANC_SMPTE_436M AVPacket's data.
+ * @param[in]  anc_packet_count number of ANC packets to encode
+ * @param[in]  anc_packets      the ANC packets to encode
+ * @param[in]  size             the size of out. ignored if out is NULL.
+ * @param[out] out              Output bytes. Doesn't write anything if out is NULL.
+ * @return the number of bytes written on success, AVERROR codes otherwise.
+ *         If out is NULL, returns the number of bytes it would have written.
+ */
+int avpriv_vanc_smpte_436m_encode(uint8_t* out, int size, int anc_packet_count, const Smpte436mCodedAnc* anc_packets);
 
 /**
  * Set up iteration over the ANC packets in a single AV_CODEC_ID_VANC_SMPTE_436M AVPacket's data.
@@ -128,22 +157,9 @@ int avpriv_vanc_smpte_436m_iter_next(VancSmpte436mIterator* iter, Smpte436mCoded
  * @param sample_coding the payload sample coding
  * @param sample_count  the number of samples stored in the payload
  * @return returns the minimum number of bytes needed, on error returns < 0.
+ *         always <= SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY
  */
 int avpriv_smpte_436m_coded_anc_payload_size(Smpte436mPayloadSampleCoding sample_coding, uint16_t sample_count);
-
-#define SMPTE_291M_ANC_PAYLOAD_CAPACITY 0xFF
-
-/**
- * An ANC packet as decoded from the payload of Smpte436mAncCoded
- */
-typedef struct Smpte291mAnc
-{
-    uint8_t did;
-    uint8_t sdid_or_dbn;
-    uint8_t data_count;
-    uint8_t payload[SMPTE_291M_ANC_PAYLOAD_CAPACITY];
-    uint8_t checksum;
-} Smpte291mAnc;
 
 /**
  * Decode a Smpte436mCodedAnc payload into Smpte291mAnc
@@ -160,6 +176,40 @@ int avpriv_smpte_291m_decode_anc(Smpte291mAnc*                out,
                                  Smpte436mPayloadSampleCoding sample_coding,
                                  uint16_t                     sample_count,
                                  const uint8_t*               payload,
+                                 void*                        log_ctx);
+
+/**
+ * Fill in the correct checksum for a Smpte291mAnc
+ * @param[in,out] anc The ANC packet.
+ */
+void avpriv_smpte_291m_anc_fill_checksum(Smpte291mAnc* anc);
+
+/**
+ * Compute the sample count needed to encode a Smpte291mAnc into a Smpte436mCodedAnc payload
+ * @param[in] anc           The ANC packet.
+ * @param[in] sample_coding The sample coding.
+ * @param[in] log_ctx       context pointer for av_log
+ * @return returns the sample count on success, otherwise < 0.
+ */
+int avpriv_smpte_291m_anc_get_sample_count(const Smpte291mAnc*          anc,
+                                           Smpte436mPayloadSampleCoding sample_coding,
+                                           void*                        log_ctx);
+
+/**
+ * Encode a Smpte291mAnc into a Smpte436mCodedAnc
+ * @param[in]  line_number   the line number the ANC packet is on
+ * @param[in]  wrapping_type the wrapping type
+ * @param[in]  sample_coding the payload sample coding
+ * @param[in]  payload       the ANC packet to encode.
+ * @param[in]  log_ctx       context pointer for av_log
+ * @param[out] out           The encoded ANC packet.
+ * @return returns 0 on success, otherwise < 0.
+ */
+int avpriv_smpte_291m_encode_anc(Smpte436mCodedAnc*           out,
+                                 uint16_t                     line_number,
+                                 Smpte436mWrappingType        wrapping_type,
+                                 Smpte436mPayloadSampleCoding sample_coding,
+                                 const Smpte291mAnc*          payload,
                                  void*                        log_ctx);
 
 /**

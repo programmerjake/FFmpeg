@@ -21,7 +21,78 @@
 
 #include "vanc_smpte_436m.h"
 #include "bytestream.h"
+#include "libavutil/avassert.h"
 #include "libavutil/error.h"
+
+typedef struct TryWrite
+{
+    uint8_t* buf;
+    int      initial_size_left;
+    int      size_left_or_error;
+} TryWrite;
+
+static av_always_inline void try_write_init(TryWrite* tw, uint8_t* buf, int buf_size)
+{
+    *tw = (TryWrite){.buf = buf, .initial_size_left = buf ? buf_size : INT_MAX};
+    if (buf && buf_size < 0)
+        tw->size_left_or_error = AVERROR_BUFFER_TOO_SMALL;
+    else
+        tw->size_left_or_error = tw->initial_size_left;
+}
+
+static av_always_inline int try_write_finish(TryWrite* tw)
+{
+    if (tw->size_left_or_error < 0)
+        return tw->size_left_or_error;
+    return tw->initial_size_left - tw->size_left_or_error;
+}
+
+static av_always_inline void try_write(TryWrite* tw, const uint8_t* buf, int buf_size)
+{
+    av_assert0(buf_size >= 0);
+    if (buf_size > tw->size_left_or_error) {
+        tw->size_left_or_error = AVERROR_INVALIDDATA;
+        return;
+    }
+    tw->size_left_or_error -= buf_size;
+    if (tw->buf) {
+        memcpy(tw->buf, buf, buf_size);
+        tw->buf += buf_size;
+    }
+}
+
+static av_always_inline void try_write_byte(TryWrite* tw, uint8_t v) { try_write(tw, &v, 1); }
+
+static av_always_inline void try_write_be16(TryWrite* tw, uint16_t v) { try_write(tw, (uint8_t[2]){v >> 8, v}, 2); }
+
+static av_always_inline void try_write_be32(TryWrite* tw, uint32_t v)
+{
+    try_write(tw, (uint8_t[4]){v >> 24, v >> 16, v >> 8, v}, 4);
+}
+
+int avpriv_vanc_smpte_436m_encode(uint8_t* out, int size, int anc_packet_count, const Smpte436mCodedAnc* anc_packets)
+{
+    // Based off Table 7 (page 13) of:
+    // https://pub.smpte.org/latest/st436/s436m-2006.pdf
+    if (anc_packet_count < 0 || anc_packet_count >= (1L << 16) || size < 0)
+        return AVERROR_INVALIDDATA;
+
+    TryWrite tw;
+    try_write_init(&tw, out, size);
+    try_write_be16(&tw, anc_packet_count);
+    for (int i = 0; i < anc_packet_count; i++) {
+        if (anc_packets[i].payload_array_length > SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY)
+            return AVERROR_INVALIDDATA;
+        try_write_be16(&tw, anc_packets[i].line_number);
+        try_write_byte(&tw, anc_packets[i].wrapping_type);
+        try_write_byte(&tw, anc_packets[i].payload_sample_coding);
+        try_write_be16(&tw, anc_packets[i].payload_sample_count);
+        try_write_be32(&tw, anc_packets[i].payload_array_length);
+        try_write_be32(&tw, 1); // payload_array_element_size
+        try_write(&tw, anc_packets[i].payload, anc_packets[i].payload_array_length);
+    }
+    return try_write_finish(&tw);
+}
 
 int avpriv_vanc_smpte_436m_iter_init(VancSmpte436mIterator* iter, const uint8_t* buf, int buf_size)
 {
@@ -48,8 +119,11 @@ int avpriv_vanc_smpte_436m_iter_next(VancSmpte436mIterator* iter, Smpte436mCoded
     anc->payload_array_length           = bytestream2_get_be32(&iter->gb);
     unsigned payload_array_element_size = bytestream2_get_be32(&iter->gb);
     unsigned payload_space              = bytestream2_get_bytes_left(&iter->gb);
-    anc->payload                        = iter->gb.buffer;
-    bytestream2_skip(&iter->gb, anc->payload_array_length);
+    if (anc->payload_array_length > SMPTE_436M_CODED_ANC_PAYLOAD_CAPACITY) {
+        bytestream2_skip(&iter->gb, anc->payload_array_length);
+        return AVERROR_INVALIDDATA;
+    }
+    bytestream2_get_buffer(&iter->gb, anc->payload, anc->payload_array_length);
     switch (anc->wrapping_type) {
         case SMPTE_436M_WRAPPING_TYPE_VANC_FRAME:
         case SMPTE_436M_WRAPPING_TYPE_VANC_FIELD_1:
@@ -144,13 +218,9 @@ int avpriv_smpte_291m_decode_anc(Smpte291mAnc*                out,
             out->data_count  = *payload++;
             if (sample_count < out->data_count + 3)
                 return AVERROR_INVALIDDATA;
+            memcpy(out->payload, payload, out->data_count);
             // the checksum isn't stored in 8-bit mode, so calculate it.
-            uint8_t checksum = out->did + out->sdid_or_dbn + out->data_count;
-            for (unsigned i = 0; i < out->data_count; i++) {
-                checksum += *payload;
-                out->payload[i] = *payload++;
-            }
-            out->checksum = checksum;
+            avpriv_smpte_291m_anc_fill_checksum(out);
             return 0;
         }
         case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA:
@@ -159,6 +229,100 @@ int avpriv_smpte_291m_decode_anc(Smpte291mAnc*                out,
             av_log(log_ctx,
                    AV_LOG_ERROR,
                    "decoding an ANC packet using the 10-bit SMPTE 436M sample coding isn't implemented.\n");
+            return AVERROR_PATCHWELCOME;
+        default:
+            return AVERROR_INVALIDDATA;
+    }
+}
+
+void avpriv_smpte_291m_anc_fill_checksum(Smpte291mAnc* anc)
+{
+    uint8_t checksum = anc->did + anc->sdid_or_dbn + anc->data_count;
+    for (unsigned i = 0; i < anc->data_count; i++) {
+        checksum += anc->payload[i];
+    }
+    anc->checksum = checksum;
+}
+
+int avpriv_smpte_291m_anc_get_sample_count(const Smpte291mAnc*          anc,
+                                           Smpte436mPayloadSampleCoding sample_coding,
+                                           void*                        log_ctx)
+{
+    switch (sample_coding) {
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA_AND_COLOR_DIFF:
+            return AVERROR_INVALIDDATA;
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_WITH_PARITY_ERROR:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF_WITH_PARITY_ERROR:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF_WITH_PARITY_ERROR:
+            return 3 + anc->data_count;
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA_AND_COLOR_DIFF:
+            av_log(log_ctx,
+                   AV_LOG_ERROR,
+                   "encoding an ANC packet using the 10-bit SMPTE 436M sample coding isn't implemented.\n");
+            return AVERROR_PATCHWELCOME;
+        default:
+            return AVERROR_INVALIDDATA;
+    }
+}
+
+int avpriv_smpte_291m_encode_anc(Smpte436mCodedAnc*           out,
+                                 uint16_t                     line_number,
+                                 Smpte436mWrappingType        wrapping_type,
+                                 Smpte436mPayloadSampleCoding sample_coding,
+                                 const Smpte291mAnc*          payload,
+                                 void*                        log_ctx)
+{
+    out->line_number           = line_number;
+    out->wrapping_type         = wrapping_type;
+    out->payload_sample_coding = sample_coding;
+
+    int ret = avpriv_smpte_291m_anc_get_sample_count(payload, sample_coding, log_ctx);
+    if (ret < 0)
+        return ret;
+
+    out->payload_sample_count = ret;
+
+    ret = avpriv_smpte_436m_coded_anc_payload_size(sample_coding, out->payload_sample_count);
+    if (ret < 0)
+        return ret;
+
+    out->payload_array_length = ret;
+
+    switch (sample_coding) {
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA_AND_COLOR_DIFF:
+            return AVERROR_INVALIDDATA;
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_WITH_PARITY_ERROR:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF_WITH_PARITY_ERROR:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF_WITH_PARITY_ERROR: {
+            // fill trailing padding with zeros
+            av_assert0(out->payload_array_length >= 4);
+            memset(out->payload + out->payload_array_length - 4, 0, 4);
+
+            out->payload[0] = payload->did;
+            out->payload[1] = payload->sdid_or_dbn;
+            out->payload[2] = payload->data_count;
+
+            memcpy(out->payload + 3, payload->payload, payload->data_count);
+            return 0;
+        }
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_COLOR_DIFF:
+        case SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA_AND_COLOR_DIFF:
+            av_log(log_ctx,
+                   AV_LOG_ERROR,
+                   "encoding an ANC packet using the 10-bit SMPTE 436M sample coding isn't implemented.\n");
             return AVERROR_PATCHWELCOME;
         default:
             return AVERROR_INVALIDDATA;
