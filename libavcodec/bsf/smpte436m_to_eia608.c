@@ -25,14 +25,14 @@
 #include "libavcodec/vanc_smpte_436m.h"
 #include "libavutil/error.h"
 
-static av_cold int ff_vanc_smpte_436m_to_eia_608_init(AVBSFContext* ctx)
+static av_cold int ff_smpte436m_to_eia608_init(AVBSFContext* ctx)
 {
     ctx->par_out->codec_type = AVMEDIA_TYPE_SUBTITLE;
     ctx->par_out->codec_id   = AV_CODEC_ID_EIA_608;
     return 0;
 }
 
-static int ff_vanc_smpte_436m_to_eia_608_filter(AVBSFContext* ctx, AVPacket* out)
+static int ff_smpte436m_to_eia608_filter(AVBSFContext* ctx, AVPacket* out)
 {
     AVPacket* in;
     int       ret = ff_bsf_get_packet(ctx, &in);
@@ -81,9 +81,9 @@ fail:
     return ret;
 }
 
-const FFBitStreamFilter ff_vanc_smpte_436m_to_eia_608_bsf = {
-    .p.name      = "vanc_smpte_436m_to_eia_608",
+const FFBitStreamFilter ff_smpte436m_to_eia608_bsf = {
+    .p.name      = "smpte436m_to_eia608",
     .p.codec_ids = (const enum AVCodecID[]){AV_CODEC_ID_VANC_SMPTE_436M, AV_CODEC_ID_NONE},
-    .init        = ff_vanc_smpte_436m_to_eia_608_init,
-    .filter      = ff_vanc_smpte_436m_to_eia_608_filter,
+    .init        = ff_smpte436m_to_eia608_init,
+    .filter      = ff_smpte436m_to_eia608_filter,
 };
