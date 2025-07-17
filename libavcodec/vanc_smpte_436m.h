@@ -53,8 +53,30 @@ typedef enum Smpte436mWrappingType
     SMPTE_436M_WRAPPING_TYPE_MAX = 0xFF,
 } Smpte436mWrappingType;
 
+// clang-format off
+#define SMPTE_436M_WRAPPING_TYPE_VANC_AVOPTIONS(flags, unit_name) \
+{ "vanc_frame", "VANC frame (interlaced or segmented progressive frame)", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_WRAPPING_TYPE_VANC_FRAME}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "vanc_field_1", "VANC field 1", 0, AV_OPT_TYPE_CONST, {.i64 = SMPTE_436M_WRAPPING_TYPE_VANC_FIELD_1}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "vanc_field_2", "VANC field 2", 0, AV_OPT_TYPE_CONST, {.i64 = SMPTE_436M_WRAPPING_TYPE_VANC_FIELD_2}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "vanc_progressive_frame", "VANC progressive frame", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_WRAPPING_TYPE_VANC_PROGRESSIVE_FRAME}, 0, 0xFF, flags, .unit = unit_name }
+
+#define SMPTE_436M_WRAPPING_TYPE_HANC_AVOPTIONS(flags, unit_name) \
+{ "hanc_frame", "HANC frame (interlaced or segmented progressive frame)", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_WRAPPING_TYPE_HANC_FRAME}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "hanc_field_1", "HANC field 1", 0, AV_OPT_TYPE_CONST, {.i64 = SMPTE_436M_WRAPPING_TYPE_HANC_FIELD_1}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "hanc_field_2", "HANC field 2", 0, AV_OPT_TYPE_CONST, {.i64 = SMPTE_436M_WRAPPING_TYPE_HANC_FIELD_2}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "hanc_progressive_frame", "HANC progressive frame", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_WRAPPING_TYPE_HANC_PROGRESSIVE_FRAME}, 0, 0xFF, flags, .unit = unit_name }
+
+#define SMPTE_436M_WRAPPING_TYPE_AVOPTIONS(flags, unit_name)   \
+    SMPTE_436M_WRAPPING_TYPE_VANC_AVOPTIONS(flags, unit_name), \
+    SMPTE_436M_WRAPPING_TYPE_HANC_AVOPTIONS(flags, unit_name)
+// clang-format on
+
 /**
- * Payload Sample Coding from Table 7 (page 13) of:
+ * Payload Sample Coding from Table 4 (page 10) and Table 7 (page 13) of:
  * https://pub.smpte.org/latest/st436/s436m-2006.pdf
  */
 typedef enum Smpte436mPayloadSampleCoding
@@ -86,6 +108,51 @@ typedef enum Smpte436mPayloadSampleCoding
     /** not a real sample coding, just here to guarantee the enum is big enough */
     SMPTE_436M_PAYLOAD_SAMPLE_CODING_MAX = 0xFF,
 } Smpte436mPayloadSampleCoding;
+
+// clang-format off
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_VBI_AVOPTIONS(flags, unit_name) \
+{ "1bit_luma", "1-bit component luma samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "1bit_color_diff", "1-bit component color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "1bit_luma_and_color_diff", "1-bit component luma and color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_1BIT_LUMA_AND_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }
+
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_SHARED_AVOPTIONS(flags, unit_name) \
+{ "8bit_luma", "8-bit component luma samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "8bit_color_diff", "8-bit component color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "8bit_luma_and_color_diff", "8-bit component luma and color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "10bit_luma", "10-bit component luma samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "10bit_color_diff", "10-bit component color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "10bit_luma_and_color_diff", "10-bit component luma and color difference samples", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_10BIT_LUMA_AND_COLOR_DIFF}, 0, 0xFF, flags, .unit = unit_name }
+
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_ANC_AVOPTIONS(flags, unit_name) \
+{ "8bit_luma_parity_error", "8-bit component luma samples with parity error", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_WITH_PARITY_ERROR}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "8bit_color_diff_parity_error", "8-bit component color difference samples with parity error", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_COLOR_DIFF_WITH_PARITY_ERROR}, 0, 0xFF, flags, .unit = unit_name }, \
+{ "8bit_luma_and_color_diff_parity_error", "8-bit component luma and color difference samples with parity error", 0, AV_OPT_TYPE_CONST, \
+    {.i64 = SMPTE_436M_PAYLOAD_SAMPLE_CODING_8BIT_LUMA_AND_COLOR_DIFF_WITH_PARITY_ERROR}, 0, 0xFF, flags, .unit = unit_name }
+
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_VBI_AVOPTIONS(flags, unit_name)      \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_VBI_AVOPTIONS(flags, unit_name), \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_SHARED_AVOPTIONS(flags, unit_name)
+
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_ANC_AVOPTIONS(flags, unit_name)    \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_SHARED_AVOPTIONS(flags, unit_name),    \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_ANC_AVOPTIONS(flags, unit_name)
+
+#define SMPTE_436M_PAYLOAD_SAMPLE_CODING_AVOPTIONS(flags, unit_name)          \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_VBI_AVOPTIONS(flags, unit_name), \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_SHARED_AVOPTIONS(flags, unit_name),      \
+    SMPTE_436M_PAYLOAD_SAMPLE_CODING_ONLY_IN_ANC_AVOPTIONS(flags, unit_name)
+// clang-format on
 
 #define SMPTE_291M_ANC_PAYLOAD_CAPACITY 0xFF
 
