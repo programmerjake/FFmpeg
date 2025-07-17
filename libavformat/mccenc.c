@@ -24,29 +24,22 @@
 #include "internal.h"
 #include "mux.h"
 
-#include "libavutil/avassert.h"
+#include "libavcodec/codec_id.h"
+#include "libavcodec/vanc_smpte_436m.h"
+
 #include "libavutil/error.h"
 #include "libavutil/log.h"
 #include "libavutil/macros.h"
-#include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/rational.h"
 #include "libavutil/timecode.h"
-
-#include "libklvanc/vanc-eia_708b.h"
-
-#include <stdint.h>
-#include <string.h>
 
 typedef struct MCCContext
 {
     const AVClass* class;
     AVTimecode                       timecode;
     int64_t                          twenty_four_hr;
-    struct klvanc_packet_eia_708b_s* eia708_cdp;
-    unsigned                         cdp_sequence_cntr;
-    char*                            override_cdp_frame_rate;
     char*                            override_time_code_rate;
     int                              use_u_alias;
 } MCCContext;
@@ -142,21 +135,167 @@ static AVRational valid_time_code_rates[] = {
 
 static int mcc_write_header(AVFormatContext* avf)
 {
-    MCCContext* mcc            = avf->priv_data;
-    AVRational  cdp_frame_rate = avf->streams[0]->avg_frame_rate;
-    AVRational  time_code_rate = avf->streams[0]->avg_frame_rate;
-    int         timecode_flags = 0;
+    MCCContext* mcc = avf->priv_data;
+    avio_printf(avf->pb,
+                "%s\n",
+                mcc->timecode.fps == 60 && (mcc->timecode.flags & AV_TIMECODE_FLAG_DROPFRAME) ? mcc_header_v2
+                                                                                              : mcc_header_v1);
+    avio_printf(avf->pb,
+                "Time Code Rate=%u%s\n\n",
+                mcc->timecode.fps,
+                mcc->timecode.flags & AV_TIMECODE_FLAG_DROPFRAME ? "DF" : "");
+
+    return 0;
+}
+
+/// convert the input bytes to hexadecimal with mcc's aliases
+static void mcc_bytes_to_hex(char* dest, const uint8_t* bytes, size_t bytes_size, int use_u_alias)
+{
+    while (bytes_size != 0) {
+        switch (bytes[0]) {
+            case 0xFA:
+                *dest = '\0';
+                for (unsigned char code = 'G'; code <= (unsigned char)'O'; code++) {
+                    if (bytes_size < 3)
+                        break;
+                    if (bytes[0] != 0xFA || bytes[1] != 0 || bytes[2] != 0)
+                        break;
+                    *dest = code;
+                    bytes += 3;
+                    bytes_size -= 3;
+                }
+                if (*dest) {
+                    dest++;
+                    continue;
+                }
+                break;
+            case 0xFB:
+            case 0xFC:
+            case 0xFD:
+                if (bytes_size >= 3 && bytes[1] == 0x80 && bytes[2] == 0x80) {
+                    *dest++ = bytes[0] - 0xFB + 'P';
+                    bytes += 3;
+                    bytes_size -= 3;
+                    continue;
+                }
+                break;
+            case 0x96:
+                if (bytes_size >= 2 && bytes[1] == 0x69) {
+                    *dest++ = 'S';
+                    bytes += 2;
+                    bytes_size -= 2;
+                    continue;
+                }
+                break;
+            case 0x61:
+                if (bytes_size >= 2 && bytes[1] == 0x01) {
+                    *dest++ = 'T';
+                    bytes += 2;
+                    bytes_size -= 2;
+                    continue;
+                }
+                break;
+            case 0xE1:
+                if (use_u_alias && bytes_size >= 4 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0) {
+                    *dest++ = 'U';
+                    bytes += 4;
+                    bytes_size -= 4;
+                    continue;
+                }
+                break;
+            case 0:
+                *dest++ = 'Z';
+                bytes++;
+                bytes_size--;
+                continue;
+            default:
+                // any other bytes falls through to writing hex
+                break;
+        }
+        for (int shift = 4; shift >= 0; shift -= 4) {
+            int v = (bytes[0] >> shift) & 0xF;
+            if (v < 0xA)
+                *dest++ = v + '0';
+            else
+                *dest++ = v - 0xA + 'A';
+        }
+        bytes++;
+        bytes_size--;
+    }
+    *dest = '\0';
+}
+
+static int mcc_write_packet(AVFormatContext* avf, AVPacket* pkt)
+{
+    MCCContext* mcc = avf->priv_data;
+    int64_t     pts = pkt->pts;
     int         ret;
-    AVTimecode  twenty_four_hr;
 
-    if (klvanc_create_eia708_cdp(&mcc->eia708_cdp) < 0)
-        return AVERROR(ENOMEM);
+    if (pts == AV_NOPTS_VALUE) {
+        av_log(avf, AV_LOG_WARNING, "Insufficient timestamps.\n");
+        return 0;
+    }
 
-    if (mcc->override_cdp_frame_rate && (ret = av_parse_video_rate(&cdp_frame_rate, mcc->override_cdp_frame_rate)) < 0)
-        goto error;
+    char timecode_str[AV_TIMECODE_STR_SIZE];
+
+    // wrap pts values at 24hr ourselves since they can be bigger than fits in an int
+    av_timecode_make_string(&mcc->timecode, timecode_str, pts % mcc->twenty_four_hr);
+
+    for (char* p = timecode_str; *p; p++) {
+        // .mcc doesn't use ; for drop-frame time codes
+        if (*p == ';')
+            *p = ':';
+    }
+
+    VancSmpte436mIterator iter;
+    ret = avpriv_vanc_smpte_436m_iter_init(&iter, pkt->data, pkt->size);
+    if (ret < 0)
+        return ret;
+    Smpte436mCodedAnc coded_anc;
+    while ((ret = avpriv_vanc_smpte_436m_iter_next(&iter, &coded_anc)) >= 0) {
+        Smpte291mAnc anc;
+        ret = avpriv_smpte_291m_decode_anc(
+            &anc, coded_anc.payload_sample_coding, coded_anc.payload_sample_count, coded_anc.payload, avf);
+        if (ret < 0)
+            return ret;
+        // 4 for did, sdid_or_dbn, data_count, and checksum fields.
+        uint8_t mcc_anc[4 + SMPTE_291M_ANC_PAYLOAD_CAPACITY];
+        size_t  mcc_anc_len = 0;
+
+        mcc_anc[mcc_anc_len++] = anc.did;
+        mcc_anc[mcc_anc_len++] = anc.sdid_or_dbn;
+        mcc_anc[mcc_anc_len++] = anc.data_count;
+        memcpy(mcc_anc + mcc_anc_len, anc.payload, anc.data_count);
+        mcc_anc_len += anc.data_count;
+        mcc_anc[mcc_anc_len++] = anc.checksum;
+
+        // 1 for terminating nul. 2 since there's 2 hex digits per byte.
+        char hex[1 + 2 * sizeof(mcc_anc)];
+        mcc_bytes_to_hex(hex, mcc_anc, mcc_anc_len, mcc->use_u_alias);
+        avio_print(avf->pb, timecode_str, "\t", hex, "\n");
+    }
+    if (ret != AVERROR_EOF)
+        return ret;
+    return 0;
+}
+
+static int mcc_init(AVFormatContext* avf)
+{
+    MCCContext* mcc = avf->priv_data;
+    int         ret;
+
+    if (avf->nb_streams != 1) {
+        av_log(avf, AV_LOG_ERROR, "mcc muxer supports at most one stream\n");
+        return AVERROR(EINVAL);
+    }
+
+    AVStream*  st             = avf->streams[0];
+    AVRational time_code_rate = st->avg_frame_rate;
+    int        timecode_flags = 0;
+    AVTimecode twenty_four_hr;
 
     if (mcc->override_time_code_rate && (ret = av_parse_video_rate(&time_code_rate, mcc->override_time_code_rate)) < 0)
-        goto error;
+        return ret;
 
     ret = AVERROR(EINVAL);
 
@@ -170,25 +309,8 @@ static int mcc_write_header(AVFormatContext* avf)
     if (ret != 0) {
         av_log(
             avf, AV_LOG_FATAL, "time code rate not supported by mcc: %d/%d\n", time_code_rate.num, time_code_rate.den);
-        ret = AVERROR(EINVAL);
-        goto error;
+        return AVERROR(EINVAL);
     }
-
-    // set values that all our vanc packets have in common:
-
-    // num/denom intentionally swapped since casparcg and ffmpeg uses the reciprocal of libklvanc
-    if (klvanc_set_framerate_EIA_708B(mcc->eia708_cdp, cdp_frame_rate.den, cdp_frame_rate.num) < 0) {
-        av_log(avf,
-               AV_LOG_FATAL,
-               "cdp_frame_rate not supported by libklvanc: %d/%d\n",
-               cdp_frame_rate.num,
-               cdp_frame_rate.den);
-        ret = AVERROR(EINVAL);
-        goto error;
-    }
-
-    mcc->eia708_cdp->header.ccdata_present         = 1;
-    mcc->eia708_cdp->header.caption_service_active = 1;
 
     if (time_code_rate.den == 1001 && time_code_rate.num % 30000 == 0) {
         timecode_flags |= AV_TIMECODE_FLAG_DROPFRAME;
@@ -196,199 +318,46 @@ static int mcc_write_header(AVFormatContext* avf)
 
     ret = av_timecode_init(&mcc->timecode, time_code_rate, timecode_flags, 0, avf);
     if (ret < 0)
-        goto error;
+        return ret;
 
     // get av_timecode to calculate how many frames are in 24hr
     ret = av_timecode_init_from_components(&twenty_four_hr, time_code_rate, timecode_flags, 24, 0, 0, 0, avf);
     if (ret < 0)
-        goto error;
+        return ret;
 
     mcc->twenty_four_hr = twenty_four_hr.start;
 
-    avpriv_set_pts_info(avf->streams[0], 64, time_code_rate.den, time_code_rate.num);
-    avio_printf(
-        avf->pb, "%s\n", time_code_rate.num == 60000 && time_code_rate.den == 1001 ? mcc_header_v2 : mcc_header_v1);
-    avio_printf(
-        avf->pb, "Time Code Rate=%u%s\n\n", mcc->timecode.fps, timecode_flags & AV_TIMECODE_FLAG_DROPFRAME ? "DF" : "");
-
-    return 0;
-
-error:
-    klvanc_destroy_eia708_cdp(mcc->eia708_cdp);
-    mcc->eia708_cdp = NULL;
-    return ret;
-}
-
-/// convert the least significant 8 bits of the input words to hexadecimal with mcc's aliases
-static char* mcc_words_to_hex(const uint16_t* words, size_t words_size, int use_u_alias)
-{
-    // at most 2 characters for each input word, plus the terminating nul
-    char* ret  = av_malloc(2 * words_size + 1);
-    char* dest = ret;
-    if (!ret)
-        return NULL;
-
-    while (words_size != 0) {
-        switch (words[0] & 0xFF) {
-            case 0xFA:
-                *dest = '\0';
-                for (unsigned char code = 'G'; code <= (unsigned char)'O'; code++) {
-                    if (words_size < 3)
-                        break;
-                    if ((words[0] & 0xFF) != 0xFA || (words[1] & 0xFF) != 0 || (words[2] & 0xFF) != 0)
-                        break;
-                    *dest = code;
-                    words += 3;
-                    words_size -= 3;
-                }
-                if (*dest) {
-                    dest++;
-                    continue;
-                }
-                break;
-            case 0xFB:
-            case 0xFC:
-            case 0xFD:
-                if (words_size >= 3 && (words[1] & 0xFF) == 0x80 && (words[2] & 0xFF) == 0x80) {
-                    *dest++ = (words[0] & 0xFF) - 0xFB + 'P';
-                    words += 3;
-                    words_size -= 3;
-                    continue;
-                }
-                break;
-            case 0x96:
-                if (words_size >= 2 && (words[1] & 0xFF) == 0x69) {
-                    *dest++ = 'S';
-                    words += 2;
-                    words_size -= 2;
-                    continue;
-                }
-                break;
-            case 0x61:
-                if (words_size >= 2 && (words[1] & 0xFF) == 0x01) {
-                    *dest++ = 'T';
-                    words += 2;
-                    words_size -= 2;
-                    continue;
-                }
-                break;
-            case 0xE1:
-                if (use_u_alias && words_size >= 4 && (words[1] & 0xFF) == 0 && (words[2] & 0xFF) == 0 &&
-                    (words[3] & 0xFF) == 0) {
-                    *dest++ = 'U';
-                    words += 4;
-                    words_size -= 4;
-                    continue;
-                }
-                break;
-            case 0:
-                *dest++ = 'Z';
-                words++;
-                words_size--;
-                continue;
-            default:
-                // any other bytes falls through to writing hex
-                break;
-        }
-        for (int shift = 4; shift >= 0; shift -= 4) {
-            int v = (words[0] >> shift) & 0xF;
-            if (v < 0xA)
-                *dest++ = v + '0';
-            else
-                *dest++ = v - 0xA + 'A';
-        }
-        words++;
-        words_size--;
-    }
-    *dest = '\0';
-    return ret;
-}
-
-static char* mcc_cc_data_to_hex(AVFormatContext* avf, const uint8_t* cc_data, size_t cc_data_size)
-{
-    MCCContext*                      mcc        = avf->priv_data;
-    struct klvanc_packet_eia_708b_s* eia708_cdp = mcc->eia708_cdp;
-    size_t                           cc_count   = cc_data_size / 3;
-    uint16_t*                        words      = NULL;
-    uint16_t                         words_size = 0;
-    char*                            ret;
-
-    if (cc_count > KLVANC_MAX_CC_COUNT) {
+    if (st->codecpar->codec_id == AV_CODEC_ID_EIA_608) {
+        char args[64];
+        snprintf(args, sizeof(args), "cdp_frame_rate=%d/%d", time_code_rate.num, time_code_rate.den);
+        ret = ff_stream_add_bitstream_filter(st, "eia608_to_smpte436m", args);
+        if (ret < 0)
+            return ret;
+    } else if (st->codecpar->codec_id != AV_CODEC_ID_VANC_SMPTE_436M) {
         av_log(avf,
                AV_LOG_ERROR,
-               "cc_count (%zu) is bigger than the maximum supported by libklvanc (%zu), truncating captions packet\n",
-               cc_count,
-               (size_t)KLVANC_MAX_CC_COUNT);
-        cc_count = KLVANC_MAX_CC_COUNT;
+               "mcc muxer supports only codec %s or codec %s\n",
+               avcodec_get_name(AV_CODEC_ID_VANC_SMPTE_436M),
+               avcodec_get_name(AV_CODEC_ID_EIA_608));
+        return AVERROR(EINVAL);
     }
 
-    eia708_cdp->ccdata.cc_count = (uint8_t)cc_count;
-    for (size_t i = 0; i < cc_count; i++) {
-        size_t start = i * 3;
-
-        eia708_cdp->ccdata.cc[i].cc_valid   = (cc_data[start] & 0x04) != 0;
-        eia708_cdp->ccdata.cc[i].cc_type    = cc_data[start] & 0x03;
-        eia708_cdp->ccdata.cc[i].cc_data[0] = cc_data[start + 1];
-        eia708_cdp->ccdata.cc[i].cc_data[1] = cc_data[start + 2];
-    }
-
-    klvanc_finalize_EIA_708B(eia708_cdp, mcc->cdp_sequence_cntr++);
-    // cdp_sequence_cntr wraps around at 16-bits
-    mcc->cdp_sequence_cntr &= 0xFFFFU;
-
-    if (klvanc_convert_EIA_708B_to_words(eia708_cdp, &words, &words_size) < 0)
-        return NULL;
-
-    // first 3 words are always 0x000 0x3ff 0x3ff and are skipped in the mcc format
-    av_assert0(words_size >= 3);
-    ret = mcc_words_to_hex(words + 3, words_size - 3, mcc->use_u_alias);
-    free(words);
-    return ret;
-}
-
-static int mcc_write_packet(AVFormatContext* avf, AVPacket* pkt)
-{
-    MCCContext* mcc = avf->priv_data;
-    int64_t     pts = pkt->pts;
-    char        timecode_str[AV_TIMECODE_STR_SIZE];
-    char*       hex;
-
-    if (pts == AV_NOPTS_VALUE) {
-        av_log(avf, AV_LOG_WARNING, "Insufficient timestamps.\n");
-        return 0;
-    }
-
-    // wrap pts values at 24hr ourselves since they can be bigger than fits in an int
-    av_timecode_make_string(&mcc->timecode, timecode_str, pts % mcc->twenty_four_hr);
-
-    for (char* p = timecode_str; *p; p++) {
-        // .mcc doesn't use ; for drop-frame time codes
-        if (*p == ';')
-            *p = ':';
-    }
-
-    hex = mcc_cc_data_to_hex(avf, pkt->data, pkt->size);
-    if (!hex)
-        return AVERROR(ENOMEM);
-
-    avio_printf(avf->pb, "%s\t%s\n", timecode_str, hex);
-    av_freep(&hex);
+    avpriv_set_pts_info(st, 64, time_code_rate.den, time_code_rate.num);
     return 0;
 }
 
-static void mcc_deinit(AVFormatContext* avf)
+static int mcc_query_codec(enum AVCodecID codec_id, int std_compliance)
 {
-    MCCContext* mcc = avf->priv_data;
-    klvanc_destroy_eia708_cdp(mcc->eia708_cdp);
-    mcc->eia708_cdp = NULL;
+    (void)std_compliance;
+    if (codec_id == AV_CODEC_ID_EIA_608 || codec_id == AV_CODEC_ID_VANC_SMPTE_436M)
+        return 1;
+    return 0;
 }
 
 #define OFFSET(x) offsetof(MCCContext, x)
 #define ENC AV_OPT_FLAG_ENCODING_PARAM
 // clang-format off
 static const AVOption options[] = {
-    { "initial_cdp_sequence_cntr", "initial cdp_*_sequence_cntr value", OFFSET(cdp_sequence_cntr), AV_OPT_TYPE_UINT, { .i64 = 0 }, 0, 0xFFFF, ENC },
-    { "override_cdp_frame_rate", "override only the `cdp_frame_rate` fields, defaults to the packet frame rate", OFFSET(override_cdp_frame_rate), AV_OPT_TYPE_STRING, { .str = NULL }, 0, INT_MAX, ENC },
     { "override_time_code_rate", "override the `Time Code Rate` value in the output", OFFSET(override_time_code_rate), AV_OPT_TYPE_STRING, { .str = NULL }, 0, INT_MAX, ENC },
     { "use_u_alias", "use the U alias for E1h 00h 00h 00h, disabled by default because some .mcc files disagree on whether it has 2 or 3 zero bytes", OFFSET(use_u_alias), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
     { NULL },
@@ -411,9 +380,9 @@ const FFOutputFormat ff_mcc_muxer = {
     .p.audio_codec    = AV_CODEC_ID_NONE,
     .p.subtitle_codec = AV_CODEC_ID_EIA_608,
     .p.priv_class     = &mcc_muxer_class,
-    .flags_internal   = FF_OFMT_FLAG_MAX_ONE_OF_EACH | FF_OFMT_FLAG_ONLY_DEFAULT_CODECS,
     .priv_data_size   = sizeof(MCCContext),
-    .deinit           = mcc_deinit,
+    .init             = mcc_init,
+    .query_codec      = mcc_query_codec,
     .write_header     = mcc_write_header,
     .write_packet     = mcc_write_packet,
 };
