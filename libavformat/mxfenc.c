@@ -3046,10 +3046,11 @@ static int mxf_init(AVFormatContext *s)
             ret = ff_stream_add_bitstream_filter(st, "pcm_rechunk", bsf_arg);
             if (ret < 0)
                 return ret;
-        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA) {
-            AVDictionaryEntry *e = av_dict_get(st->metadata, "data_type", NULL, 0);
+        } else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA || st->codecpar->codec_id == AV_CODEC_ID_EIA_608) {
+            AVDictionaryEntry* e = av_dict_get(st->metadata, "data_type", NULL, 0);
             if ((e && !strcmp(e->value, "vbi_vanc_smpte_436M")) ||
-                st->codecpar->codec_id == AV_CODEC_ID_VANC_SMPTE_436M) {
+                st->codecpar->codec_id == AV_CODEC_ID_VANC_SMPTE_436M ||
+                st->codecpar->codec_id == AV_CODEC_ID_EIA_608) {
                 sc->index = INDEX_S436M;
             } else {
                 av_log(s, AV_LOG_ERROR, "track %d: unsupported data type\n", i);
@@ -3058,6 +3059,16 @@ static int mxf_init(AVFormatContext *s)
             if (st->index != s->nb_streams - 1) {
                 av_log(s, AV_LOG_ERROR, "data track must be placed last\n");
                 return -1;
+            }
+            if (st->codecpar->codec_id == AV_CODEC_ID_EIA_608) {
+                char bsf_arg[64] = "";
+                if (mxf->time_base.num != 0 && mxf->time_base.den != 0) {
+                    // frame rate is reciprocal of time base
+                    snprintf(bsf_arg, sizeof(bsf_arg), "cdp_frame_rate=%d/%d", mxf->time_base.den, mxf->time_base.num);
+                }
+                ret = ff_stream_add_bitstream_filter(st, "eia608_to_smpte436m", bsf_arg);
+                if (ret < 0)
+                    return ret;
             }
         }
 
@@ -3657,6 +3668,7 @@ const FFOutputFormat ff_mxf_muxer = {
     .priv_data_size    = sizeof(MXFContext),
     .p.audio_codec     = AV_CODEC_ID_PCM_S16LE,
     .p.video_codec     = AV_CODEC_ID_MPEG2VIDEO,
+    .p.subtitle_codec  = AV_CODEC_ID_EIA_608,
     .init              = mxf_init,
     .write_packet      = mxf_write_packet,
     .write_trailer     = mxf_write_footer,
@@ -3691,6 +3703,7 @@ const FFOutputFormat ff_mxf_opatom_muxer = {
     .priv_data_size    = sizeof(MXFContext),
     .p.audio_codec     = AV_CODEC_ID_PCM_S16LE,
     .p.video_codec     = AV_CODEC_ID_DNXHD,
+    .p.subtitle_codec  = AV_CODEC_ID_EIA_608,
     .init              = mxf_init,
     .write_packet      = mxf_write_packet,
     .write_trailer     = mxf_write_footer,
