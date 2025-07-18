@@ -30,7 +30,10 @@
 #include "libavutil/avutil.h"
 #include "libavutil/internal.h"
 #include "libavutil/opt.h"
+#include "libavutil/rational.h"
+#include "libavutil/timecode.h"
 #include "subtitles.h"
+#include <stdbool.h>
 
 typedef struct MCCContext {
     const AVClass* class;
@@ -97,12 +100,50 @@ static const alias aliases[20] = {
     { .key = 35, .len =  1, .value = "\x0", },
 };
 
-static int mcc_read_header(AVFormatContext *s)
+typedef struct TimeTracker
 {
-    MCCContext *mcc = s->priv_data;
-    AVStream *st = avformat_new_stream(s, NULL);
-    AVRational rate = {0};
-    int64_t ts, pos;
+    int64_t    last_ts;
+    int64_t    twenty_four_hr;
+    AVTimecode timecode;
+} TimeTracker;
+
+static int time_tracker_init(TimeTracker* tt, AVStream* st, AVRational rate, bool is_drop_frame, void* log_ctx)
+{
+    *tt     = (TimeTracker){.last_ts = 0};
+    int ret = av_timecode_init(&tt->timecode, rate, is_drop_frame ? AV_TIMECODE_FLAG_DROPFRAME : 0, 0, log_ctx);
+    if (ret < 0)
+        return ret;
+    // wrap pts values at 24hr ourselves since they can be bigger than fits in an int
+    AVTimecode twenty_four_hr;
+    ret = av_timecode_init_from_components(&twenty_four_hr, rate, tt->timecode.flags, 24, 0, 0, 0, log_ctx);
+    if (ret < 0)
+        return ret;
+    tt->twenty_four_hr = twenty_four_hr.start;
+    // timecode uses reciprocal of timebase
+    avpriv_set_pts_info(st, 64, rate.den, rate.num);
+    return 0;
+}
+
+static int time_tracker_set_time(TimeTracker* tt, int hh, int mm, int ss, int ff, void* log_ctx)
+{
+    AVTimecode last = tt->timecode;
+    int        ret  = av_timecode_init_from_components(&tt->timecode, last.rate, last.flags, hh, mm, ss, ff, log_ctx);
+    if (ret < 0) {
+        tt->timecode = last;
+        return ret;
+    }
+    tt->last_ts -= last.start;
+    tt->last_ts += tt->timecode.start;
+    if (tt->timecode.start < last.start)
+        tt->last_ts += tt->twenty_four_hr;
+    return 0;
+}
+
+static int mcc_read_header(AVFormatContext* s)
+{
+    MCCContext*       mcc = s->priv_data;
+    AVStream*         st  = avformat_new_stream(s, NULL);
+    int64_t           pos;
     Smpte436mCodedAnc coded_anc = {
         .line_number           = mcc->vanc_line,
         .wrapping_type         = SMPTE_436M_WRAPPING_TYPE_VANC_FRAME,
@@ -124,7 +165,11 @@ static int mcc_read_header(AVFormatContext *s)
         st->codecpar->codec_id   = AV_CODEC_ID_VANC_SMPTE_436M;
         av_dict_set(&st->metadata, "data_type", "vbi_vanc_smpte_436M", 0);
     }
-    avpriv_set_pts_info(st, 64, 1, 30);
+
+    TimeTracker tt;
+    ret = time_tracker_init(&tt, st, (AVRational){.num = 30, .den = 1}, false, s);
+    if (ret < 0)
+        return ret;
 
     while (!ff_text_eof(&tr)) {
         ff_subtitles_read_line(&tr, line, sizeof(line));
@@ -135,28 +180,34 @@ static int mcc_read_header(AVFormatContext *s)
         if (!strncmp(line, "Time Code Rate=", 15)) {
             char *rate_str = line + 15;
             char *df = NULL;
-            int num = -1, den = -1;
+
+            AVRational rate          = {.num = -1, .den = -1};
+            bool       is_drop_frame = false;
 
             if (rate_str[0]) {
-                num = strtol(rate_str, &df, 10);
-                den = 1;
+                rate.num = strtol(rate_str, &df, 10);
+                rate.den = 1;
                 if (df && !av_strncasecmp(df, "DF", 2)) {
-                    av_reduce(&num, &den, num * 1000LL, 1001, INT_MAX);
+                    is_drop_frame = true;
+                    rate          = av_mul_q(rate, (AVRational){.num = 1000, .den = 1001});
                 }
             }
 
-            if (num > 0 && den > 0) {
-                rate = av_make_q(num, den);
-                avpriv_set_pts_info(st, 64, rate.den, rate.num);
+            if (rate.num > 0 && rate.den > 0) {
+                ret = time_tracker_init(&tt, st, rate, is_drop_frame, s);
+                if (ret < 0)
+                    return ret;
             }
             continue;
         }
 
-        int hh, mm, ss, fs, timestamp_len;
-        if (av_sscanf(line, "%d:%d:%d:%d%n", &hh, &mm, &ss, &fs, &timestamp_len) != 4 || rate.den <= 0)
+        int hh, mm, ss, ff, timestamp_len;
+        if (av_sscanf(line, "%d:%d:%d:%d%n", &hh, &mm, &ss, &ff, &timestamp_len) != 4)
             continue;
 
-        ts = av_sat_add64(av_rescale(hh * 3600LL + mm * 60LL + ss, rate.num, rate.den), fs);
+        ret = time_tracker_set_time(&tt, hh, mm, ss, ff, s);
+        if (ret < 0)
+            continue;
 
         char* lline = line + timestamp_len;
         if (*lline != '\t')
@@ -221,7 +272,7 @@ static int mcc_read_header(AVFormatContext *s)
             return AVERROR(ENOMEM);
 
         sub->pos      = pos;
-        sub->pts      = ts;
+        sub->pts      = tt.last_ts;
         sub->duration = 1;
     }
 
