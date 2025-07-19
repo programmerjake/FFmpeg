@@ -22,17 +22,20 @@
 
 #include "avformat.h"
 #include "internal.h"
+#include "libavutil/avassert.h"
 #include "mux.h"
 
 #include "libavcodec/codec_id.h"
 #include "libavcodec/vanc_smpte_436m.h"
 
 #include "libavutil/error.h"
+#include "libavutil/ffversion.h"
 #include "libavutil/log.h"
 #include "libavutil/macros.h"
 #include "libavutil/opt.h"
 #include "libavutil/parseutils.h"
 #include "libavutil/rational.h"
+#include "libavutil/time_internal.h" // for localtime_r
 #include "libavutil/timecode.h"
 
 typedef struct MCCContext
@@ -42,7 +45,18 @@ typedef struct MCCContext
     int64_t                          twenty_four_hr;
     char*                            override_time_code_rate;
     int                              use_u_alias;
+    unsigned                         mcc_version;
+    char*                            creation_program;
+    char*                            creation_time;
 } MCCContext;
+
+typedef enum MCCVersion
+{
+    MCC_VERSION_1   = 1,
+    MCC_VERSION_2   = 2,
+    MCC_VERSION_MIN = MCC_VERSION_1,
+    MCC_VERSION_MAX = MCC_VERSION_2,
+} MCCVersion;
 
 static const char mcc_header_v1[] =
     "File Format=MacCaption_MCC V1.0\n"
@@ -101,7 +115,6 @@ static const char mcc_header_v2[] =
     "//     Each time code line must contain at most one complete ancillary data packet.\n"
     "//     To transfer additional ANC Data successive lines may contain identical time code.\n"
     "//     Time Code Rate=[24, 25, 30, 30DF, 50, 60, 60DF]\n"
-    "//     Time Code Rate=[24, 25, 30, 30DF, 50, 60]\n"
     "//\n"
     "//   ANC data bytes may be represented by one ASCII character according to the following schema:\n"
     "//     G  FAh 00h 00h\n"
@@ -123,6 +136,15 @@ static const char mcc_header_v2[] =
     "//\n"
     "///////////////////////////////////////////////////////////////////////////////////\n";
 
+/**
+ * generated with the bash command:
+ * ```bash
+ * URL="https://git.ffmpeg.org/gitweb/ffmpeg.git/blob/HEAD:/libavformat/mccenc.c"
+ * python3 -c "from uuid import *; print(str(uuid5(NAMESPACE_DNS, '$URL')).upper())"
+ * ```
+ */
+static const char mcc_ffmpeg_uuid[] = "DF41D764-0C19-549D-9478-3D4E4A2EF325";
+
 static AVRational valid_time_code_rates[] = {
     {.num = 24, .den = 1},
     {.num = 25, .den = 1},
@@ -136,12 +158,74 @@ static AVRational valid_time_code_rates[] = {
 static int mcc_write_header(AVFormatContext* avf)
 {
     MCCContext* mcc = avf->priv_data;
+    const char* mcc_header = mcc_header_v1;
+    switch ((MCCVersion)mcc->mcc_version) {
+        case MCC_VERSION_1:
+            if (mcc->timecode.fps == 60 && mcc->timecode.flags & AV_TIMECODE_FLAG_DROPFRAME) {
+                av_log(avf, AV_LOG_FATAL, "MCC Version 1.0 doesn't support 60DF (59.94 fps drop-frame)");
+                return AVERROR(EINVAL);
+            }
+            break;
+        case MCC_VERSION_2:
+            mcc_header = mcc_header_v2;
+            break;
+    }
+    const char* creation_program = mcc->creation_program ? mcc->creation_program : "FFmpeg version " FFMPEG_VERSION;
+    if (strchr(creation_program, '\n')) {
+        av_log(avf, AV_LOG_FATAL, "creation_program must not contain multiple lines of text");
+        return AVERROR(EINVAL);
+    }
+    int64_t timeval = 0;
+    int     ret     = av_parse_time(&timeval, mcc->creation_time, 0);
+    if (ret < 0) {
+        av_log(avf, AV_LOG_FATAL, "can't parse creation_time");
+        return ret;
+    }
+    struct tm tm;
+    if (!localtime_r((time_t[1]){timeval / 1000000}, &tm))
+        return AVERROR(EINVAL);
+    // we can't rely on having the C locale, so convert the date/time to a string ourselves:
+    static const char* const months[12] = {
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    };
+    // assert that values are sane so we don't index out of bounds
+    av_assert0(tm.tm_mon >= 0 && tm.tm_mon <= FF_ARRAY_ELEMS(months));
+    const char* month = months[tm.tm_mon];
+
+    static const char* const weekdays[7] = {
+        "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+    // assert that values are sane so we don't index out of bounds
+    av_assert0(tm.tm_wday >= 0 && tm.tm_wday < FF_ARRAY_ELEMS(weekdays));
+    const char* weekday = weekdays[tm.tm_wday];
+
     avio_printf(avf->pb,
-                "%s\n",
-                mcc->timecode.fps == 60 && (mcc->timecode.flags & AV_TIMECODE_FLAG_DROPFRAME) ? mcc_header_v2
-                                                                                              : mcc_header_v1);
-    avio_printf(avf->pb,
+                "%s\n"
+                "UUID=%s\n"
+                "Creation Program=%s\n"
+                "Creation Date=%s, %s %d, %d\n"
+                "Creation Time=%02d:%02d:%02d\n"
                 "Time Code Rate=%u%s\n\n",
+                mcc_header,
+                mcc_ffmpeg_uuid,
+                creation_program,
+                weekday,
+                month,
+                tm.tm_mday,
+                tm.tm_year + 1900,
+                tm.tm_hour,
+                tm.tm_min,
+                tm.tm_sec,
                 mcc->timecode.fps,
                 mcc->timecode.flags & AV_TIMECODE_FLAG_DROPFRAME ? "DF" : "");
 
@@ -269,10 +353,51 @@ static int mcc_write_packet(AVFormatContext* avf, AVPacket* pkt)
         mcc_anc_len += anc.data_count;
         mcc_anc[mcc_anc_len++] = anc.checksum;
 
+        unsigned field_number;
+        switch (coded_anc.wrapping_type) {
+            case SMPTE_436M_WRAPPING_TYPE_VANC_FRAME:
+            case SMPTE_436M_WRAPPING_TYPE_VANC_FIELD_1:
+            case SMPTE_436M_WRAPPING_TYPE_VANC_PROGRESSIVE_FRAME:
+                field_number = 0;
+                break;
+            case SMPTE_436M_WRAPPING_TYPE_VANC_FIELD_2:
+                field_number = 1;
+                break;
+            default:
+                av_log(avf,
+                       AV_LOG_WARNING,
+                       "Unsupported ANC SMPTE 436M Wrapping Type %#x -- discarding ANC packet",
+                       (unsigned)coded_anc.wrapping_type);
+                continue;
+        }
+
+        char field_and_line[32] = "";
+        if (coded_anc.line_number != 9) {
+            snprintf(field_and_line, sizeof(field_and_line), ".%u,%u", field_number, (unsigned)coded_anc.line_number);
+        } else if (field_number != 0) {
+            snprintf(field_and_line, sizeof(field_and_line), ".%u", field_number);
+        }
+
+        switch ((MCCVersion)mcc->mcc_version) {
+            case MCC_VERSION_1:
+                if (field_and_line[0] != '\0') {
+                    av_log(avf,
+                           AV_LOG_WARNING,
+                           "MCC Version 1.0 doesn't support ANC packets where the field number (got %u) isn't 0 and "
+                           "line number (got %u) isn't 9: discarding ANC packet",
+                           field_number,
+                           (unsigned)coded_anc.line_number);
+                    continue;
+                }
+                break;
+            case MCC_VERSION_2:
+                break;
+        }
+
         // 1 for terminating nul. 2 since there's 2 hex digits per byte.
         char hex[1 + 2 * sizeof(mcc_anc)];
         mcc_bytes_to_hex(hex, mcc_anc, mcc_anc_len, mcc->use_u_alias);
-        avio_print(avf->pb, timecode_str, "\t", hex, "\n");
+        avio_printf(avf->pb, "%s%s\t%s\n", timecode_str, field_and_line, hex);
     }
     if (ret != AVERROR_EOF)
         return ret;
@@ -360,6 +485,9 @@ static int mcc_query_codec(enum AVCodecID codec_id, int std_compliance)
 static const AVOption options[] = {
     { "override_time_code_rate", "override the `Time Code Rate` value in the output", OFFSET(override_time_code_rate), AV_OPT_TYPE_STRING, { .str = NULL }, 0, INT_MAX, ENC },
     { "use_u_alias", "use the U alias for E1h 00h 00h 00h, disabled by default because some .mcc files disagree on whether it has 2 or 3 zero bytes", OFFSET(use_u_alias), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, ENC },
+    { "mcc_version", "the mcc file format version", OFFSET(mcc_version), AV_OPT_TYPE_UINT, { .i64 = MCC_VERSION_2 }, MCC_VERSION_MIN, MCC_VERSION_MAX, ENC },
+    { "creation_program", "the creation program", OFFSET(creation_program), AV_OPT_TYPE_STRING, { .str = NULL }, 0, INT_MAX, ENC },
+    { "creation_time", "the creation time", OFFSET(creation_time), AV_OPT_TYPE_STRING, { .str = "now" }, 0, INT_MAX, ENC },
     { NULL },
 };
 // clang-format on
